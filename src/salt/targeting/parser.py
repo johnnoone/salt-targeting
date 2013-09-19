@@ -8,10 +8,13 @@ salt.targeting.parser
 
 from functools import wraps
 import re
+import logging
+log = logging.getLogger(__name__)
 
 __all__ = [
     'to_python',
     'parse',
+    'tokenize',
 ]
 
 tokenize = re.compile(r'''
@@ -19,13 +22,18 @@ tokenize = re.compile(r'''
     (?P<or_stmt> \bor(?=[\s$]) ) |
     (?P<not_stmt> \bnot(?=[\s$]) ) |
     (?P<sub_query> \(.+\s.+\)(?!\S) ) |
-    (?P<rule> \S+ )
-''', flags=re.VERBOSE | re.MULTILINE | re.X).finditer
+    (?P<expr> \S+ )
 
+''', flags=re.VERBOSE | re.MULTILINE | re.X).finditer
 
 def parse(query, parse_rule):
     python_stmt = to_python(query)
-    return eval(python_stmt, {'parse_rule': parse_rule})
+    try:
+        return eval(python_stmt, {'parse_rule': parse_rule})
+    except SyntaxError as e:
+        log.exception(e)
+        log.error('Query {0} has been parsed has {1}'.format(repr(query), repr(python_stmt)))
+        raise SyntaxError('Unexpected error while parsing {0}'.format(repr(query)))
 
 def to_python(source):
     parser = QueryState()
@@ -33,8 +41,13 @@ def to_python(source):
     for each in tokenize(source):
         dispatch = getattr(parser, each.lastgroup)
         dispatch(each.group(), builder)
+    if builder and builder[-1] in ('-', '|', '&'):
+        log.error('SyntaxError: {0} -> {1}'.format(repr(source), repr(builder)))
+        raise SyntaxError('Unexpected operator at the end of {0}'.format(repr(source)))
     return ' '.join(builder)
 
+def normalize(value):
+    return ' '.join(value.strip().split())
 
 def transition(method):
     @wraps(method)
@@ -89,9 +102,9 @@ class QueryState(ParsingState):
         return pushing(GroupState)
 
     @transition
-    def rule(self, data, builder):
+    def expr(self, data, builder):
         builder.append('parse_rule(' + repr(data) + ')')
-        return pushing(GroupState)
+        return pushing(ExprState)
 
     @transition
     def not_stmt(self, data, builder):
@@ -110,7 +123,18 @@ class GroupState(ParsingState):
         builder.append('|')
         return shifting(QueryState)
 
-    def rule(self, data, builder):
+    def expr(self, data, builder):
         raise ValueError(
-            'Statement is missing before {0} rule'.format(repr(data))
+            'Statement is missing before {0} expr'.format(repr(data))
         )
+
+
+class ExprState(GroupState):
+    def expr(self, data, builder):
+        # normalize space between 2 expr
+        last = builder.pop()
+        if last.startswith('parse_rule(') and last.endswith(')'):
+            log.warning('Merging 2 following tokens')
+            builder.append(last[:-1] + repr(' ') + repr(data) + last[-1])
+            return unchanged
+        return GroupState.expr(self, data, builder)

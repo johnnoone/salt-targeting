@@ -16,7 +16,6 @@ class MinionMock(object):
         args = []
         for k, v in self.kwargs.items():
             args.append(k + '='+ repr(v))
-        args.append('is_doubt=' + repr(is_doubt(self)))
         return "MinionMock({0})".format(', '.join(args))
     __repr__ = __str__
 

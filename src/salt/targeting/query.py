@@ -8,8 +8,7 @@ salt.targeting.query
 
 import inspect
 from salt.targeting import rules
-from salt.targeting.parser import parse
-from functools import partial
+from salt.targeting.parser import parse, normalize
 
 import logging
 log = logging.getLogger(__name__)
@@ -20,7 +19,6 @@ __all__ = [
     'RuleEvaluator',
     'NodeGroupEvaluator',
     'Query',
-    'compound',
 ]
 
 class Evaluator(object):
@@ -28,14 +26,17 @@ class Evaluator(object):
 
 
 class ListEvaluator(Evaluator):
+    """
+    Converts comma separated value to AnyMatcher(default) matcher.
+    """
     def __init__(self, parent):
         self.parent = parent
 
-    def __call__(self, raw_value, parameters):
-        rule = parameters.get('default_rule', rules.GlobRule)
+    def __call__(self, raw_value, opts):
+        rule = opts.get('default_rule', rules.GlobRule)
         evaluator = RuleEvaluator(self.parent, rule)
         sub_rules = [
-            evaluator(value, parameters) for value in raw_value.split(',')
+            evaluator(value, opts) for value in raw_value.split(',')
         ]
 
         return rules.AnyRule(*sub_rules)
@@ -45,10 +46,10 @@ class NodeGroupEvaluator(Evaluator):
     def __init__(self, parent):
         self.parent = parent
 
-    def __call__(self, raw_value, parameters):
+    def __call__(self, raw_value, opts):
         try:
-            query = parameters['macros'][raw_value]
-            return self.parent.parse(query, **parameters)
+            query = opts['macros'][raw_value]
+            return self.parent.parse(query, **opts)
         except KeyError:
             raise Exception('node group {0} is not defined'.format(raw_value))
 
@@ -65,26 +66,34 @@ class RuleEvaluator(Evaluator):
         self.varargs = arg_spec.varargs
         self.keywords = arg_spec.keywords
 
-        log.debug('rule {0} args = {0}, varargs=, keywords='.format(self.arguments))
-
-
-    def __call__(self, raw_value, parameters):
+    def __call__(self, raw_value, opts):
         """
         raw_value is always the first value or Rule instance
-        parameters may contribute to the others.
+        opts may contribute to the others.
         """
         args, kwargs = [], {}
-        for key, value in parameters.items():
-            if key in self.arguments:
-                kwargs[key] = value
-        if self.keywords and self.keywords in parameters:
-            kwargs[self.keywords] = parameters[self.keywords]
-        if self.varargs and self.varargs in parameters:
-            args = parameters[self.varargs]
+
+        # if opts has self.varargs or self.keywords keys,
+        # use them as default values for self.rule.
+        if self.varargs and self.varargs in opts:
+            args = opts[self.varargs]
             if not isinstance(args, (list, tuple)):
                 raise ValueError('{0} is not iterable'.format(self.varargs))
+        if self.keywords and self.keywords in opts:
+            try:
+                kwargs.update(opts[self.keywords])
+            except ValueError as e:
+                log.error('opts {0} must be a dict'.format(self.keywords))
+                raise e
+
+        for key in self.arguments:
+            if key in opts:
+                kwargs[key] = opts[key]
+        # raw_value is always the 1st argument
+        kwargs[self.arguments[0]] = raw_value
+
         try:
-            return self.rule(raw_value, *args, **kwargs)
+            return self.rule(*args, **kwargs)
         except TypeError as e:
             log.debug('fail: class={0}({1}, *args={2}, **kwargs={3})'.format(
                 self.rule.__name__,
@@ -94,12 +103,13 @@ class RuleEvaluator(Evaluator):
             ))
             raise e
 
-def make_evaluator(obj, targeting):
+
+def make_evaluator(obj, query):
     try:
         if issubclass(obj, rules.Rule):
-            return RuleEvaluator(targeting, obj)
+            return RuleEvaluator(query, obj)
         if issubclass(obj, Evaluator):
-            return obj(targeting)
+            return obj(query)
     except TypeError:
         pass
 
@@ -107,39 +117,39 @@ def make_evaluator(obj, targeting):
 
 
 class Query(object):
-    def __init__(self, default_rule=None, **parameters):
+    def __init__(self, default_rule, **opts):
         self.registry = {}
         self.evaluators = {}
-        self.parameters = {
-            'default_rule': default_rule or rules.GlobRule,
+        self.opts = {
+            'default_rule': default_rule,
             'delim': ':',
             'macros': {},
         }
-        self.parameters.update(parameters)
+        self.opts.update(opts)
 
-    def register(self, prefix, obj, shortcut=None):
+    def register(self, obj, prefix=None, passthru=None):
         if prefix and prefix in self.registry:
             raise ValueError('Prefix already registered')
-        if shortcut:
-            funcname = 'parse_' + shortcut
-            if hasattr(self, 'funcname'):
+        if passthru:
+            funcname = 'parse_' + passthru
+            if hasattr(self, funcname):
                 raise AttributeError(
                     "{0} object already has attribute {1}".format(
                         repr(self.__class__.__name__), funcname))
 
         evaluator = make_evaluator(obj, self)
 
-        if shortcut:
-            def curried_func(query, **parameters):
+        if passthru:
+            def curried_func(query, **opts):
                 try:
-                    parser_parameters = self.parameters.copy()
-                    parser_parameters.update(parameters)
-                    return evaluator(query, parser_parameters)
+                    parser_opts = self.opts.copy()
+                    parser_opts.update(opts)
+                    return evaluator(normalize(query), parser_opts)
                 except TypeError as e:
                     log.debug('fail: evaluator={0}, class_params={1}, func_params={2}'.format(
                         evaluator.__class__.__name__,
-                        repr(self.parameters),
-                        repr(parameters)
+                        repr(self.opts),
+                        repr(opts)
                     ))
                     raise e
             curried_func.__name__ = funcname
@@ -150,25 +160,25 @@ class Query(object):
             self.evaluators[prefix] = evaluator
             self.registry[prefix] = obj
 
-    def parse(self, query, **parameters):
-        parser_parameters = self.parameters.copy()
-        if parameters:
-            parser_parameters.update(parameters)
-        default_evaluator = RuleEvaluator(self, parser_parameters['default_rule'])
+    def parse(self, query, **opts):
+        parser_opts = self.opts.copy()
+        if opts:
+            parser_opts.update(opts)
+        default_evaluator = RuleEvaluator(self, parser_opts['default_rule'])
         def parse_rule(value):
             prefix, sep, raw_value = value.partition('@')
             if prefix and raw_value and prefix in self.evaluators:
-                return self.evaluators[prefix](raw_value, parser_parameters)
-            return default_evaluator(value, parser_parameters)
+                return self.evaluators[prefix](raw_value, parser_opts)
+            return default_evaluator(value, parser_opts)
 
         return parse(query, parse_rule)
 
     parse_compound = parse
 
-    def querify(self, obj, **parameters):
-        parser_parameters = self.parameters.copy()
-        if parameters:
-            parser_parameters.update(parameters)
+    def querify(self, obj, **opts):
+        parser_opts = self.opts.copy()
+        if opts:
+            parser_opts.update(opts)
         def parenthize(objs):
             for obj in objs:
                 if isinstance(obj, (rules.AnyRule, rules.AllRule)):
@@ -179,26 +189,12 @@ class Query(object):
         if isinstance(obj, rules.NotRule):
             return 'not ' + ''.join(parenthize([obj.rule]))
         if isinstance(obj, rules.AnyRule):
-            return ' or '.join(parenthize(obj.rules))
+            return ' or '.join(parenthize(obj.__iter__()))
         if isinstance(obj, rules.AllRule):
-            return ' and '.join(parenthize(obj.rules))
-        if isinstance(obj, parser_parameters['default_rule']):
+            return ' and '.join(parenthize(obj.__iter__()))
+        if isinstance(obj, parser_opts['default_rule']):
             return obj.expr
         for prefix, base in self.registry.items():
             if isinstance(obj, base):
                 return prefix + '@' + obj.expr
         raise Exception('Not defined for {0}'.format(repr(obj.__class__.__name__)))
-
-
-compound = Query()
-compound.register(None, rules.GlobRule, 'glob')
-compound.register('G', rules.GrainRule, 'grain')
-compound.register('I', rules.PillarRule, 'pillar')
-compound.register('E', rules.PCRERule, 'pcre')
-compound.register('P', rules.GrainPCRERule, 'grain_pcre')
-compound.register('S', rules.SubnetIPRule)
-compound.register('X', rules.ExselRule, 'exsel')
-compound.register('D', rules.LocalStoreRule)
-compound.register('R', rules.YahooRangeRule)
-compound.register('L', ListEvaluator, 'list')
-compound.register('N', NodeGroupEvaluator)
