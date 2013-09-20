@@ -27,6 +27,24 @@ tokenize = re.compile(r'''
 ''', flags=re.VERBOSE | re.MULTILINE | re.X).finditer
 
 def parse(query, parse_rule):
+    """
+    Parses a compound query to a python expression.
+
+    :query:
+        compound query. for example::
+
+            foo and bar and not baz
+
+    :parse_rule:
+        callable with an arity of 1, and must implements boolean operators.
+        For example::
+
+            def func(expr):
+                return set()
+
+    parse('foo and bar', func) --> func('foo') & func('bar')
+    """
+
     python_stmt = to_python(query)
     try:
         return eval(python_stmt, {'parse_rule': parse_rule})
